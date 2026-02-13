@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Hinata Bot - Updated version
-- Restored old features: keyword alerts, forwarding, tracked user forwarding, broadcasts, group tracking
-- Added separate AI endpoints: Gemini3 (shawon-gemini-3-api), DeepSeek 3.2 (void-deep), Insta-Info, Free Fire player info
-- Added inline buttons to start flows (Gemini, DeepSeek, Insta, FF)
-- Buttons set context flags so next user message is used as prompt/username/uid
-- Deployable as-is (place token in token.txt)
+Hinata Bot - Updated (httpx instead of aiohttp)
+- Uses httpx.AsyncClient to avoid building native wheels (aiohttp C extensions)
+- Restores keywords, forwarding, tracked users, broadcasts, group tracking
+- Inline buttons to start Gemini / DeepSeek / Insta / FF flows
+- Deployable to Render (use python 3.11 recommended)
 """
 import asyncio
 import logging
@@ -13,12 +12,11 @@ import json
 import os
 import time
 from datetime import timedelta
-from aiohttp import ClientSession
+import httpx
 from telegram import (
     Update,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    InputMediaPhoto
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -27,7 +25,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
     ChatMemberHandler,
-    CallbackQueryHandler
+    CallbackQueryHandler,
 )
 
 # ================= Configuration =================
@@ -38,13 +36,13 @@ BOT_USERNAME = "@Hinata_00_bot"
 
 INBOX_FORWARD_GROUP_ID = -1003113491147
 
-# tracked users -> forward groups (restore from original file)
+# tracked users -> forward groups
 TRACKED_USER1_ID = 7039869055
 FORWARD_USER1_GROUP_ID = -1002768142169
 TRACKED_USER2_ID = 7209584974
 FORWARD_USER2_GROUP_ID = -1002536019847
 
-# source/destination (restore)
+# source/destination
 SOURCE_GROUP_ID = -4767799138
 DESTINATION_GROUP_ID = -1002510490386
 
@@ -56,10 +54,10 @@ KEYWORDS = [
 LOG_FILE = "hinata.log"
 MAX_LOG_SIZE = 200 * 1024  # 200 KB
 
-# Old ChatGPT style API (kept to preserve old functionality)
+# Old ChatGPT style API (kept for compatibility)
 CHATGPT_API_URL = "https://addy-chatgpt-api.vercel.app/?text={prompt}"
 
-# ================= NEW APIs =================
+# ================= NEW APIs (user-provided) =================
 GEMINI3_API = "https://shawon-gemini-3-api.onrender.com/api/ask?prompt={}"
 DEEPSEEK_API = "https://void-deep.hosters.club/api/?q={}"
 INSTA_API = "https://instagram-api-ashy.vercel.app/api/ig-profile.php?username={}"
@@ -112,7 +110,7 @@ def get_uptime() -> str:
 def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
 
-# ================= Forward Helper (kept from original) =================
+# ================= Forward Helper =================
 async def forward_or_copy(update: Update, context: ContextTypes.DEFAULT_TYPE, command_text: str = None):
     user = update.effective_user
     msg_type = "Command" if command_text else "Message"
@@ -123,55 +121,51 @@ async def forward_or_copy(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         elif update.message and update.message.text:
             caption += f"\nMessage: {update.message.text}"
 
-        # send short copy to inbox forward group
         await context.bot.send_message(chat_id=INBOX_FORWARD_GROUP_ID, text=caption, parse_mode="HTML")
         if update.message:
             await update.message.forward(chat_id=INBOX_FORWARD_GROUP_ID)
     except Exception as e:
         logger.warning(f"Failed to forward: {e}")
-        # fallback: send safe text only
         try:
             if update.message:
                 text = update.message.text or "<Media/Sticker/Other>"
                 safe_text = f"📨 From: {user.full_name} (@{user.username})\nID: <code>{user.id}</code>\nType: {msg_type}\nContent: {text}"
                 await context.bot.send_message(chat_id=INBOX_FORWARD_GROUP_ID, text=safe_text, parse_mode="HTML")
         except Exception as e2:
-            logger.warning(f"Failed to send fallback message: {e2}")
+            logger.warning(f"Failed fallback forward: {e2}")
 
-# ================= API Fetch Helpers =================
-async def fetch_json(session: ClientSession, url: str):
+# ================= HTTP Helpers using httpx =================
+async def fetch_json(client: httpx.AsyncClient, url: str):
     try:
-        async with session.get(url, timeout=30) as resp:
-            text = await resp.text()
-            try:
-                return json.loads(text)
-            except Exception:
-                return {"raw": text}
+        resp = await client.get(url, timeout=30.0)
+        text = resp.text
+        try:
+            return json.loads(text)
+        except Exception:
+            return {"raw": text}
     except Exception as e:
         logger.exception("HTTP GET failed for %s", url)
         return {"error": str(e)}
 
-async def fetch_text(session: ClientSession, url: str):
+async def fetch_text(client: httpx.AsyncClient, url: str):
     try:
-        async with session.get(url, timeout=30) as resp:
-            return await resp.text()
+        resp = await client.get(url, timeout=30.0)
+        return resp.text
     except Exception as e:
         logger.exception("HTTP GET failed for %s", url)
         return f"Error: {e}"
 
-async def fetch_chatgpt(session, prompt):
+async def fetch_chatgpt(client: httpx.AsyncClient, prompt: str):
     url = CHATGPT_API_URL.format(prompt=prompt.replace(" ", "+"))
-    data = await fetch_json(session, url)
-    # older API returns "reply" field in some versions; be flexible
+    data = await fetch_json(client, url)
     if isinstance(data, dict):
         return data.get("reply") or data.get("response") or data.get("answer") or json.dumps(data)
     return str(data)
 
-async def fetch_gemini3(session, prompt):
+async def fetch_gemini3(client: httpx.AsyncClient, prompt: str):
     try:
         url = GEMINI3_API.format(prompt.replace(" ", "+"))
-        data = await fetch_json(session, url)
-        # many small self-hosted APIs return either {"response": "..."} or {"reply": "..."} or raw text
+        data = await fetch_json(client, url)
         if isinstance(data, dict):
             return data.get("response") or data.get("reply") or data.get("answer") or json.dumps(data)
         return str(data)
@@ -179,11 +173,10 @@ async def fetch_gemini3(session, prompt):
         logger.exception("Gemini3 fetch failed")
         return f"Error: {e}"
 
-async def fetch_deepseek(session, prompt):
+async def fetch_deepseek(client: httpx.AsyncClient, prompt: str):
     try:
         url = DEEPSEEK_API.format(prompt.replace(" ", "+"))
-        # DeepSeek returns raw text often
-        text = await fetch_text(session, url)
+        text = await fetch_text(client, url)
         return text
     except Exception as e:
         logger.exception("DeepSeek fetch failed")
@@ -209,14 +202,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = (f"👤 <b>New User Started Bot</b>\n"
            f"Name: {user.full_name}\nUsername: @{user.username}\nID: <code>{user.id}</code>")
-    # notify owner privately
     try:
         await context.bot.send_message(chat_id=OWNER_ID, text=msg, parse_mode="HTML")
-    except:
-        # ignore
+    except Exception:
         pass
 
-    # Inline buttons menu
     buttons = [
         [InlineKeyboardButton("🧠 Gemini 3", callback_data="btn_gemini"),
          InlineKeyboardButton("🔥 DeepSeek", callback_data="btn_deepseek")],
@@ -276,8 +266,8 @@ async def cmd_gemini(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     prompt = " ".join(context.args)
     msg = await update.message.reply_text("🤖 Gemini 3 is thinking... ⏳")
-    async with ClientSession() as session:
-        reply = await fetch_gemini3(session, prompt)
+    async with httpx.AsyncClient() as client:
+        reply = await fetch_gemini3(client, prompt)
     await msg.edit_text(f"🧠 *Gemini 3 Response*\n\n{reply}", parse_mode="Markdown")
 
 async def cmd_deepseek(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -287,8 +277,8 @@ async def cmd_deepseek(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     prompt = " ".join(context.args)
     msg = await update.message.reply_text("🚀 DeepSeek 3.2 is thinking... ⏳")
-    async with ClientSession() as session:
-        reply = await fetch_deepseek(session, prompt)
+    async with httpx.AsyncClient() as client:
+        reply = await fetch_deepseek(client, prompt)
     await msg.edit_text(f"🔥 *DeepSeek 3.2 Response*\n\n{reply}", parse_mode="Markdown")
 
 async def cmd_ai_combined(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -298,35 +288,31 @@ async def cmd_ai_combined(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     prompt = " ".join(context.args)
     msg = await update.message.reply_text("🤖 Asking both AI engines... ⏳")
-    async with ClientSession() as session:
-        task1 = fetch_chatgpt(session, prompt)
-        task2 = fetch_gemini3(session, prompt)
+    async with httpx.AsyncClient() as client:
+        task1 = fetch_chatgpt(client, prompt)
+        task2 = fetch_gemini3(client, prompt)
         chatgpt_reply, gemini_reply = await asyncio.gather(task1, task2)
     text = f"💡 *AI Responses*\n\n*ChatGPT:*\n{chatgpt_reply}\n\n*Gemini 3:*\n{gemini_reply}"
     await msg.edit_text(text, parse_mode="Markdown")
 
 # ================= Insta & FF helper flows (button or command) =================
-# We'll use user_data flags so the inline button can set a flag and the very next message is used.
-
 AWAIT_GEMINI = "await_gemini"
 AWAIT_DEEPSEEK = "await_deepseek"
 AWAIT_INSTA = "await_insta"
 AWAIT_FF = "await_ff"
 
 async def start_insta_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Called by command /insta or by callback button (we set flag)
     if update.message:
         await forward_or_copy(update, context, "/insta")
         await update.message.reply_text("📸 Send Instagram username (e.g. zuck):")
     else:
-        # callback query case handled in callback handler
         await context.bot.send_message(chat_id=update.effective_chat.id, text="📸 Send Instagram username (e.g. zuck):")
     context.user_data[AWAIT_INSTA] = True
 
 async def do_insta_fetch_by_text(update: Update, context: ContextTypes.DEFAULT_TYPE, username: str):
     msg = await update.message.reply_text("🔎 Fetching Instagram info...")
-    async with ClientSession() as session:
-        data = await fetch_json(session, INSTA_API.format(username))
+    async with httpx.AsyncClient() as client:
+        data = await fetch_json(client, INSTA_API.format(username))
     if not isinstance(data, dict) or data.get("status") != "ok":
         await msg.edit_text("❌ Failed to fetch Instagram data.")
         return
@@ -362,9 +348,8 @@ async def start_ff_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def do_ff_fetch_by_text(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: str):
     msg = await update.message.reply_text("🎯 Fetching Free Fire player info...")
-    async with ClientSession() as session:
-        data = await fetch_json(session, FF_API.format(uid))
-    # show JSON blob for now; you can shape it further
+    async with httpx.AsyncClient() as client:
+        data = await fetch_json(client, FF_API.format(uid))
     text = f"🎮 *Free Fire Player Info*\n\n```{json.dumps(data, indent=2)}```"
     await msg.edit_text(text, parse_mode="Markdown")
 
@@ -372,8 +357,7 @@ async def do_ff_fetch_by_text(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
-    await query.answer()  # acknowledge
-
+    await query.answer()
     if data == "btn_gemini":
         context.user_data[AWAIT_GEMINI] = True
         await query.edit_message_text("🧠 Send your *Gemini 3* prompt now (just type message):", parse_mode="Markdown")
@@ -387,29 +371,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data[AWAIT_FF] = True
         await query.edit_message_text("🎮 Send Free Fire UID:", parse_mode="Markdown")
     elif data == "btn_ping":
-        await query.edit_message_text("🏓 Pinging... please use /ping or wait a moment.")
+        await query.edit_message_text("🏓 Use /ping or press again if needed.")
     elif data == "btn_help":
         await query.edit_message_text("❓ Use /help or type a command. Buttons start a flow that expects the next message to be the input.")
     else:
         await query.edit_message_text("Unknown action.")
 
-# ================= Message Handler (keeps original features + handles button flows) =================
+# ================= Message Handler (restored features + flows) =================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not msg.from_user:
         return
-
     user = msg.from_user
-
-    # If user_data flags exist, process them first (these are set by inline buttons)
     ud = context.user_data
 
     # GEMINI via button
     if ud.pop(AWAIT_GEMINI, False):
         prompt = msg.text or ""
         sent = await msg.reply_text("🤖 Gemini 3 is thinking... ⏳")
-        async with ClientSession() as session:
-            reply = await fetch_gemini3(session, prompt)
+        async with httpx.AsyncClient() as client:
+            reply = await fetch_gemini3(client, prompt)
         await sent.edit_text(f"🧠 *Gemini 3 Response*\n\n{reply}", parse_mode="Markdown")
         return
 
@@ -417,8 +398,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ud.pop(AWAIT_DEEPSEEK, False):
         prompt = msg.text or ""
         sent = await msg.reply_text("🚀 DeepSeek is thinking... ⏳")
-        async with ClientSession() as session:
-            reply = await fetch_deepseek(session, prompt)
+        async with httpx.AsyncClient() as client:
+            reply = await fetch_deepseek(client, prompt)
         await sent.edit_text(f"🔥 *DeepSeek 3.2 Response*\n\n{reply}", parse_mode="Markdown")
         return
 
@@ -434,11 +415,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await do_ff_fetch_by_text(update, context, uid)
         return
 
-    # Forward private messages to inbox group (original functionality)
+    # Forward private messages
     if msg.chat.type == "private":
         await forward_or_copy(update, context)
 
-    # Keyword alerts (original)
+    # Keyword alerts
     if msg.text:
         lowered = msg.text.lower()
         for keyword in KEYWORDS:
@@ -456,7 +437,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 continue
 
-    # Tracked users forwarding (original)
+    # Tracked users forwarding
     try:
         if msg.from_user.id == TRACKED_USER1_ID:
             await context.bot.send_message(chat_id=FORWARD_USER1_GROUP_ID,
@@ -471,7 +452,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.exception("Tracked forward failed")
 
-    # Source -> Destination forwarding (original)
+    # Source -> Destination
     try:
         if msg.chat.id == SOURCE_GROUP_ID:
             try:
@@ -480,10 +461,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if msg.text:
                     copy_text = f"📨 From: {msg.from_user.full_name} (@{msg.from_user.username})\nContent: {msg.text}"
                     await context.bot.send_message(chat_id=DESTINATION_GROUP_ID, text=copy_text)
-    except:
+    except Exception:
         pass
 
-# ================= Group Tracking Handler (when bot is added to group) =================
+# ================= Group Tracking Handler =================
 async def track_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.my_chat_member.chat
     if chat.type in ["group", "supergroup"]:
@@ -492,7 +473,7 @@ async def track_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
             groups.append(chat.id)
             write_json("groups.json", groups)
 
-# ================= Broadcast Commands (owner only, from original) =================
+# ================= Broadcast Commands (owner only) =================
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         return
@@ -564,16 +545,16 @@ def main():
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("help", cmd_help))
 
-    # AI command handlers
+    # AI
     app.add_handler(CommandHandler("gemini", cmd_gemini))
     app.add_handler(CommandHandler("deepseek", cmd_deepseek))
     app.add_handler(CommandHandler("ai", cmd_ai_combined))
 
-    # Insta / FF commands (set flag to expect next message)
+    # Insta / FF
     app.add_handler(CommandHandler("insta", start_insta_flow))
     app.add_handler(CommandHandler("ff", start_ff_flow))
 
-    # Owner broadcast commands
+    # Broadcasts
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("broadcastall", broadcastall))
     app.add_handler(CommandHandler("broadcast_media", broadcast_media))
@@ -581,7 +562,7 @@ def main():
     # Callback button handler
     app.add_handler(CallbackQueryHandler(callback_handler))
 
-    # Message handler (one handler for many functions)
+    # Message handler
     app.add_handler(MessageHandler(filters.ALL, handle_message))
 
     # Track bot added to group
