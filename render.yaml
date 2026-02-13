@@ -1,1 +1,7 @@
-
+services:
+  - type: web
+    name: hinata-bot
+    runtime: python
+    buildCommand: ""
+    startCommand: python bot.py
+    plan: free
