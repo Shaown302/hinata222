@@ -2,6 +2,7 @@ services:
   - type: web
     name: hinata-bot
     runtime: python
+    runtime_version: "3.11"
     buildCommand: ""
     startCommand: python bot.py
     plan: free
