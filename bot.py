@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Hinata Bot - Updated (httpx instead of aiohttp)
-- Uses httpx.AsyncClient to avoid building native wheels (aiohttp C extensions)
-- Restores keywords, forwarding, tracked users, broadcasts, group tracking
+Hinata Bot - Final (httpx, inline buttons, restored features)
+- Uses httpx.AsyncClient to avoid building native wheels
+- Restored keywords, forwarding, tracked users, broadcasts, group tracking
 - Inline buttons to start Gemini / DeepSeek / Insta / FF flows
 - Deployable to Render (use python 3.11 recommended)
 """
